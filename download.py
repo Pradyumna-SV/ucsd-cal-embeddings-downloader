@@ -1,32 +1,54 @@
 import os
-from queue import Queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
-from pelicanfs.core import PelicanFileSystem
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-MANIFEST_PATH = os.path.join(os.path.dirname(__file__), 'manifest.csv')
-BASE_DIR      = '/workspace/embeddings'
-SUFFIXES      = ['_centers.json', '_mean.npy', '_var.npy', '_tile2vec.npy']
-CHUNK_SIZE    = 1024 * 1024  # 1 MB
-MAX_WORKERS   = 16
+MANIFEST_PATH  = os.path.join(os.path.dirname(__file__), 'manifest.csv')
+BASE_DIR       = '/workspace/embeddings'
+SUFFIXES       = ['_centers.json', '_mean.npy', '_var.npy', '_tile2vec.npy']
+CHUNK_SIZE     = 1 * 1024 * 1024  # 1 MB
+MAX_WORKERS    = 16
+REQUEST_TIMEOUT = (30, 120)  # (connect, read) seconds
+OSDF_DIRECTOR  = 'https://osdf-director.osg-htc.org'
 
-print('Loading manifest...', flush=True)
-manifest = pd.read_csv(MANIFEST_PATH)
-queue = (
-    manifest[manifest['status'] == 'OK']
-    .sort_values(['year', 'month', 'day'])
-    .reset_index(drop=True)
-)
-print(f'Days to download: {len(queue)}  |  Workers: {MAX_WORKERS}', flush=True)
-os.makedirs(BASE_DIR, exist_ok=True)
 
-# Pre-create one PelicanFileSystem per worker in the main thread (not thread-safe to init in parallel)
-print(f'Initializing {MAX_WORKERS} Pelican connections...', flush=True)
-pelfs_pool = Queue()
-for _ in range(MAX_WORKERS):
-    pelfs_pool.put(PelicanFileSystem('pelican://osg-htc.org'))
-print('All connections ready.', flush=True)
+def make_session():
+    session = requests.Session()
+    retry = Retry(
+        total=5,
+        backoff_factor=1.0,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=('GET', 'HEAD'),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS)
+    session.mount('http://',  adapter)
+    session.mount('https://', adapter)
+    return session
+
+
+session = make_session()
+
+
+def download_file(remote_path, local_path):
+    url      = f'{OSDF_DIRECTOR}{remote_path}'
+    tmp_path = local_path + '.tmp'
+    try:
+        with session.get(url, stream=True, allow_redirects=True, timeout=REQUEST_TIMEOUT) as r:
+            r.raise_for_status()
+            with open(tmp_path, 'wb') as dst:
+                for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
+                    if chunk:
+                        dst.write(chunk)
+        os.rename(tmp_path, local_path)
+        return True, None
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        return False, str(e)
 
 
 def download_day(row):
@@ -38,37 +60,34 @@ def download_day(row):
     local_dir  = os.path.join(BASE_DIR, str(year), f'{month:02d}', f'{day:02d}')
     os.makedirs(local_dir, exist_ok=True)
 
-    pelfs = pelfs_pool.get()  # borrow a connection
     day_failed = False
-    try:
-        for suffix in SUFFIXES:
-            local_path  = os.path.join(local_dir, f'{prefix}{suffix}')
-            remote_path = f'{remote_dir}{prefix}{suffix}'
+    for suffix in SUFFIXES:
+        local_path  = os.path.join(local_dir, f'{prefix}{suffix}')
+        remote_path = f'{remote_dir}{prefix}{suffix}'
 
-            if os.path.exists(local_path):
-                continue
+        if os.path.exists(local_path):
+            continue
 
-            tmp_path = local_path + '.tmp'
-            try:
-                with pelfs.open(remote_path, 'rb') as src, open(tmp_path, 'wb') as dst:
-                    while True:
-                        chunk = src.read(CHUNK_SIZE)
-                        if not chunk:
-                            break
-                        dst.write(chunk)
-                os.rename(tmp_path, local_path)
-            except Exception as e:
-                print(f'  FAILED {remote_path}: {e}', flush=True)
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-                day_failed = True
-    finally:
-        pelfs_pool.put(pelfs)  # always return connection to pool
+        ok, err = download_file(remote_path, local_path)
+        if not ok:
+            print(f'  FAILED {remote_path}: {err}', flush=True)
+            day_failed = True
 
     return (year, month, day), day_failed
 
 
+print('Loading manifest...', flush=True)
+manifest = pd.read_csv(MANIFEST_PATH)
+queue = (
+    manifest[manifest['status'] == 'OK']
+    .sort_values(['year', 'month', 'day'])
+    .reset_index(drop=True)
+)
 total = len(queue)
+print(f'Days to download: {total}  |  Workers: {MAX_WORKERS}', flush=True)
+print(f'Director: {OSDF_DIRECTOR}', flush=True)
+os.makedirs(BASE_DIR, exist_ok=True)
+
 success, failed = 0, 0
 
 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
